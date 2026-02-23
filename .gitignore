@@ -8,4 +8,5 @@ Intermediate/
 *.VC.db
 *.suo
 *.user
-*.exe
+*.ex
+.idea/
