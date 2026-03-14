@@ -162,6 +162,7 @@
     <ClCompile Include="HeaderIndex.cpp" />
     <ClCompile Include="ModuleDiscovery.cpp" />
     <ClCompile Include="BuildCsReader.cpp" />
+    <ClCompile Include="UnusedDependencyAnalyzer.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="BuildCsReader.h" />
@@ -170,6 +171,7 @@
     <ClInclude Include="HeaderIndex.h" />
     <ClInclude Include="IncludeScanner.h" />
     <ClInclude Include="ModuleDiscovery.h" />
+    <ClInclude Include="UnusedDependencyAnalyzer.h" />
   </ItemGroup>
   <ItemGroup>
     <Content Include="DependencyAnalyzer.h" />

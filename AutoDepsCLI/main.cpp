@@ -11,6 +11,7 @@
 #include "ModuleDiscovery.h"
 #include "HeaderIndex.h"
 #include "IncludeScanner.h"
+#include "UnusedDependencyAnalyzer.h"
 
 namespace fs = std::filesystem;
 
@@ -172,11 +173,9 @@ if (command == "report")
 {
     std::cout << "Building header index...\n";
 
-    // 1) Build header index (project + engine)
     HeaderIndex index;
     index.Reset();
 
-    // build project index
     {
         std::vector<fs::path> moduleRoots;
         std::vector<std::string> moduleNames;
@@ -191,7 +190,6 @@ if (command == "report")
         index.BuildProject(moduleRoots, moduleNames);
     }
 
-    // build engine index (required)
     if (engineRoot.empty())
     {
         std::cout << "ERROR: report requires --engine <UE_ROOT>\n";
@@ -199,29 +197,28 @@ if (command == "report")
     }
     index.BuildEngine(engineRoot, /*bIncludeDeveloper*/ true, /*bIncludeEditor*/ true);
 
-    // 2) Scan includes (project only)
     std::cout << "Scanning includes...\n";
     IncludeScanner scanner;
     scanner.Scan(modules);
 
-    // 3) Analyze missing deps based on header index
     std::cout << "Analyzing...\n";
     DependencyAnalyzer analyzer;
-    auto issues = analyzer.Analyze(index, scanner.GetResults());
+    auto rawIssues = analyzer.Analyze(index, scanner.GetResults());
+    auto issues = rawIssues;
 
-    // 4) Read Build.cs deps, then filter "already declared" Missing
-    //    目标：只保留“真实缺失”
     std::unordered_map<std::string, fs::path> buildCsMap;
     buildCsMap.reserve(modules.size());
 
     for (const auto& m : modules)
     {
-        // 注意：需要 ModuleInfo 里有 BuildCsPath
         buildCsMap[m.Name] = m.BuildCsPath;
     }
 
     BuildCsReader buildReader;
     auto depsMap = buildReader.ReadAll(buildCsMap);
+
+    UnusedDependencyAnalyzer unusedAnalyzer;
+    auto unusedReport = unusedAnalyzer.Analyze(rawIssues, depsMap);
 
     std::vector<DependencyIssue> filtered;
     filtered.reserve(issues.size());
@@ -238,11 +235,10 @@ if (command == "report")
         {
             continue;
         }
-        // 如果 Build.cs 里已经声明过对 TargetModule 的依赖，则不算“真实缺失”
+
         auto it = depsMap.find(i.ModuleName);
         if (it != depsMap.end())
         {
-            // 简化版：不区分 Public/Private（只要在 Public 或 Private 任何一个集合里就算已声明）
             if (it->second.Has(i.TargetModule))
             {
                 continue;
@@ -254,7 +250,6 @@ if (command == "report")
 
     issues = std::move(filtered);
 
-    // 5) Summary
     size_t missing = 0, amb = 0, unr = 0;
     for (const auto& i : issues)
     {
@@ -263,12 +258,14 @@ if (command == "report")
         else if (i.Kind == "Unresolved") unr++;
     }
 
+    size_t unused = unusedReport.Issues.size();
+
     std::cout << "\nSummary:\n";
     std::cout << "  Missing   : " << missing << "\n";
     std::cout << "  Ambiguous : " << amb << "\n";
-    std::cout << "  Unresolved: " << unr << "\n\n";
+    std::cout << "  Unresolved: " << unr << "\n";
+    std::cout << "  Unused    : " << unused << "\n\n";
 
-    // 6) Print details (evidence)
     for (const auto& i : issues)
     {
         std::cout << "[" << i.Kind << "] " << i.ModuleName << "\n";
@@ -279,8 +276,6 @@ if (command == "report")
         {
             std::cout << "  Owner  : " << i.TargetModule << "\n";
 
-            // 可选：给一个建议写到 Build.cs 的位置（Public/Private）
-            // 规则很粗：SourceFile 路径包含 "/Public/" => Public，否则 Private
             std::string vis = DependencyRules::SuggestVisibility(i.SourceFile);
             std::cout << "  Suggest: " << vis << "DependencyModuleNames.Add(\"" << i.TargetModule << "\")\n";
         }
@@ -298,8 +293,24 @@ if (command == "report")
         std::cout << "\n";
     }
 
+    if (!unusedReport.Issues.empty())
+    {
+        std::cout << "Possibly Unused Dependencies:\n\n";
+
+        for (const auto& u : unusedReport.Issues)
+        {
+            std::cout << "[Unused] " << u.ModuleName << "\n";
+            std::cout << "  Visibility: " << u.Visibility << "\n";
+            std::cout << "  Module    : " << u.TargetModule << "\n\n";
+        }
+
+        std::cout << "Note: these dependencies have no direct include evidence in scanned source files.\n";
+        std::cout << "They may still be required by reflection, build configuration, or indirect usage.\n\n";
+    }
+
     return 0;
 }
+
     
     if (command == "fix")
 {

@@ -1,10 +1,62 @@
 #include "HeaderIndex.h"
 #include <iostream>
+#include <vector>
 
 static bool IsHeaderFile(const fs::path& p)
 {
     const std::string ext = p.extension().string();
     return ext == ".h" || ext == ".hpp" || ext == ".inl";
+}
+
+// 中文注释：统一头文件 key，避免路径分隔符和 "./" 导致匹配不上
+static std::string NormalizeHeaderKey(std::string s)
+{
+    for (char& c : s)
+    {
+        if (c == '\\')
+        {
+            c = '/';
+        }
+    }
+
+    if (s.rfind("./", 0) == 0)
+    {
+        s = s.substr(2);
+    }
+
+    while (!s.empty() &&
+           (s.back() == ' ' || s.back() == '\t' || s.back() == '\r' || s.back() == '\n'))
+    {
+        s.pop_back();
+    }
+
+    return s;
+}
+
+// 中文注释：
+// 一个真实头文件生成多个别名 key，提高 include 命中率。
+// 例如：Public/GameFramework/Character.h
+// 会生成：
+// 1. GameFramework/Character.h
+// 2. Character.h
+static std::vector<std::string> BuildHeaderAliases(const fs::path& relPath)
+{
+    std::vector<std::string> keys;
+    keys.reserve(2);
+
+    const std::string fullKey = NormalizeHeaderKey(relPath.generic_string());
+    if (!fullKey.empty())
+    {
+        keys.push_back(fullKey);
+    }
+
+    const std::string shortKey = NormalizeHeaderKey(relPath.filename().generic_string());
+    if (!shortKey.empty() && shortKey != fullKey)
+    {
+        keys.push_back(shortKey);
+    }
+
+    return keys;
 }
 
 bool HeaderIndex::ShouldSkipPath(const fs::path& p)
@@ -60,13 +112,37 @@ void HeaderIndex::ScanPublicDir(const std::string& moduleName,
     if (!fs::exists(publicDir))
         return;
 
+    // 中文注释：
+    // 向索引中注册 owner。
+    // 同一个 key 允许多个模块 owner 共存，这样后续 DependencyAnalyzer 才能正确报 Ambiguous。
+    // 但同一个模块不能重复插入。
+    auto AddOwnerToIndex = [this](const std::string& key, const HeaderOwner& owner)
+    {
+        auto& owners = Index[key];
+
+        for (const auto& existing : owners)
+        {
+            if (existing.ModuleName == owner.ModuleName &&
+                existing.bIsEngine == owner.bIsEngine)
+            {
+                return;
+            }
+        }
+
+        owners.push_back(owner);
+    };
+
     std::error_code ec;
     fs::recursive_directory_iterator it(publicDir, fs::directory_options::skip_permission_denied, ec);
     fs::recursive_directory_iterator end;
 
     for (; it != end; it.increment(ec))
     {
-        if (ec) { ec.clear(); continue; }
+        if (ec)
+        {
+            ec.clear();
+            continue;
+        }
 
         const fs::path p = it->path();
 
@@ -74,7 +150,9 @@ void HeaderIndex::ScanPublicDir(const std::string& moduleName,
         if (it->is_directory(ec))
         {
             if (ShouldSkipPath(p))
+            {
                 it.disable_recursion_pending();
+            }
             continue;
         }
 
@@ -84,24 +162,40 @@ void HeaderIndex::ScanPublicDir(const std::string& moduleName,
         if (!IsHeaderFile(p))
             continue;
 
-        // key = 相对 Public 目录的路径
+        // key 基于相对目录路径生成
         fs::path rel = fs::relative(p, publicDir, ec);
-        if (ec) { ec.clear(); continue; }
-
-        std::string key = rel.generic_string();
-
-        // 跳过 generated
-        if (key.find(".generated.") != std::string::npos)
+        if (ec)
+        {
+            ec.clear();
             continue;
+        }
+
+        const auto keys = BuildHeaderAliases(rel);
 
         HeaderOwner owner;
         owner.ModuleName = moduleName;
         owner.bIsEngine = bIsEngine;
 
-        Index[key].push_back(owner);
+        bool bCounted = false;
 
-        if (bIsEngine) EngineHeaderFiles++;
-        else ProjectHeaderFiles++;
+        for (const auto& key : keys)
+        {
+            if (key.empty())
+                continue;
+
+            // 跳过 generated
+            if (key.find(".generated.") != std::string::npos)
+                continue;
+
+            AddOwnerToIndex(key, owner);
+            bCounted = true;
+        }
+
+        if (bCounted)
+        {
+            if (bIsEngine) EngineHeaderFiles++;
+            else ProjectHeaderFiles++;
+        }
     }
 }
 
@@ -129,8 +223,10 @@ void HeaderIndex::ScanEngineSourceGroup(const fs::path& engineSourceRoot,
 {
     if (!bEnabled) return;
 
-    // 目标结构：Engine/Source/<groupName>/<ModuleName>/Public/**
-    // 例如：Engine/Source/Runtime/Core/Public/**
+    // 中文注释：
+    // 目标结构：
+    // Engine/Source/<groupName>/<ModuleName>/Public/**
+    // Engine/Source/<groupName>/<ModuleName>/Classes/**
     const fs::path groupRoot = engineSourceRoot / groupName;
     if (!fs::exists(groupRoot))
         return;
@@ -138,57 +234,46 @@ void HeaderIndex::ScanEngineSourceGroup(const fs::path& engineSourceRoot,
     std::error_code ec;
     for (const auto& entry : fs::directory_iterator(groupRoot, ec))
     {
-        if (ec) { ec.clear(); break; }
-        if (!entry.is_directory(ec)) continue;
+        if (ec)
+        {
+            ec.clear();
+            break;
+        }
 
-        const fs::path moduleRoot = entry.path();            // .../<ModuleName>
-        const fs::path publicDir = moduleRoot / "Public";    // .../<ModuleName>/Public
+        if (!entry.is_directory(ec))
+            continue;
+
+        const fs::path moduleRoot = entry.path();
         const std::string moduleName = moduleRoot.filename().string();
 
-        ScanPublicDir(moduleName, publicDir, true);
+        ScanPublicDir(moduleName, moduleRoot / "Public", true);
+        ScanPublicDir(moduleName, moduleRoot / "Classes", true);
     }
 }
 
 void HeaderIndex::ScanEnginePlugins(const fs::path& enginePluginsRoot)
 {
-    // 目标结构：Engine/Plugins/**/Source/<ModuleName>/Public/**
-    // 例如：Engine/Plugins/EnhancedInput/Source/EnhancedInput/Public/**
+    // 中文注释：
+    // 目标结构：
+    // Engine/Plugins/**/Source/<ModuleName>/Public/**
+    // Engine/Plugins/**/Source/<ModuleName>/Classes/**
     if (!fs::exists(enginePluginsRoot))
         return;
 
     std::error_code ec;
-    fs::recursive_directory_iterator it(enginePluginsRoot, fs::directory_options::skip_permission_denied, ec);
+    fs::recursive_directory_iterator dit(enginePluginsRoot, fs::directory_options::skip_permission_denied, ec);
     fs::recursive_directory_iterator end;
 
-    for (; it != end; it.increment(ec))
+    for (; dit != end; dit.increment(ec))
     {
-        if (ec) { ec.clear(); continue; }
-
-        const fs::path p = it->path();
-
-        // 目录过滤：命中噪声目录就不深入
-        if (it->is_directory(ec))
+        if (ec)
         {
-            if (ShouldSkipPath(p))
-                it.disable_recursion_pending();
+            ec.clear();
             continue;
         }
 
-        if (!it->is_regular_file(ec))
+        if (!dit->is_directory(ec))
             continue;
-
-        // 我们不在这里扫文件，而是找 Public 目录再去 ScanPublicDir（避免重复）
-        // 所以这里用目录判断：如果当前路径是 .../Public 并且其父是模块目录（.../<ModuleName>/Public）
-        // 但 recursive_directory_iterator 走的是文件/目录混合，所以我们改成：遇到目录时处理。
-    }
-
-    // 上面那种“遍历文件”不好做 Public 目录捕获，我们换一种更稳的：递归遍历目录，发现 Public 目录就处理并停止深入。
-    ec.clear();
-    fs::recursive_directory_iterator dit(enginePluginsRoot, fs::directory_options::skip_permission_denied, ec);
-    for (; dit != end; dit.increment(ec))
-    {
-        if (ec) { ec.clear(); continue; }
-        if (!dit->is_directory(ec)) continue;
 
         const fs::path dirPath = dit->path();
 
@@ -198,17 +283,22 @@ void HeaderIndex::ScanEnginePlugins(const fs::path& enginePluginsRoot)
             continue;
         }
 
-        // 识别：.../Source/<ModuleName>/Public
-        if (dirPath.filename() == "Public")
+        const std::string dirName = dirPath.filename().string();
+
+        // 识别：
+        // .../Source/<ModuleName>/Public
+        // .../Source/<ModuleName>/Classes
+        if (dirName == "Public" || dirName == "Classes")
         {
-            const fs::path moduleRoot = dirPath.parent_path();          // .../Source/<ModuleName>
-            const fs::path sourceRoot = moduleRoot.parent_path();       // .../Source
+            const fs::path moduleRoot = dirPath.parent_path();    // .../Source/<ModuleName>
+            const fs::path sourceRoot = moduleRoot.parent_path(); // .../Source
+
             if (sourceRoot.filename() == "Source")
             {
                 const std::string moduleName = moduleRoot.filename().string();
                 ScanPublicDir(moduleName, dirPath, true);
 
-                // Public 已经扫过了，不必继续深入 Public 子目录（ScanPublicDir 自己会递归）
+                // 当前目录已经交给 ScanPublicDir 递归处理，这里不必再继续深入
                 dit.disable_recursion_pending();
             }
         }
@@ -232,6 +322,7 @@ void HeaderIndex::BuildEngine(const fs::path& engineRoot,
         std::cout << "[HeaderIndex] Engine folder not found: " << engineDir.string() << "\n";
         return;
     }
+
     if (!fs::exists(sourceRoot))
     {
         std::cout << "[HeaderIndex] Engine Source not found: " << sourceRoot.string() << "\n";
