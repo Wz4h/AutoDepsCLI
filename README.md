@@ -1,3 +1,9 @@
+## Video Demo
+
+Bilibili: 【[UE工具] C++模块依赖分析与修复】 https://www.bilibili.com/video/BV146f8BCEwY/?share_source=copy_web&vd_source=7c0f429dfce391615f0c93741056b2e9
+
+---
+
 # AutoDepsCLI
 
 **Unreal Engine C++ Module Dependency Analyzer**  
